@@ -33,7 +33,7 @@ Módulo	Tema
 10	Resposta a Incidentes
 ...	......................
 
-C## omo utilizar
+## Como utilizar
 
 A leitura recomendada segue a ordem numérica dos módulos. Cada pasta possui:
 
