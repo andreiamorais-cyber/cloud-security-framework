@@ -31,7 +31,7 @@ Módulo	Tema
 08	DevSecOps
 09	Monitoramento e Detecção
 10	Resposta a Incidentes
-...	...
+...	......................
 
 C## omo utilizar
 
