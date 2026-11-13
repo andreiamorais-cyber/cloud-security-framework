@@ -51,7 +51,7 @@ A leitura recomendada segue a ordem numérica dos módulos. Cada pasta possui:
 
 ✅ 02 - Shared Responsibility Model
 
-🚧 ## Demais módulos em desenvolvimento.
+🚧 Demais módulos em desenvolvimento.
 
 ## Referências
 
