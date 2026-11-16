@@ -1,0 +1,254 @@
+# Monitoramento de Identidade, Detecção, Resposta, Modelos e Checklist
+
+> **Objetivo pedagógico:** monitorar as fontes de eventos de identidade nos três provedores, definir detecções para os comportamentos de abuso mais relevantes (entrada sem MFA, uso da conta raiz, criação de credenciais e de usuários, alteração de papéis e de políticas de confiança, concessão de consentimentos, alteração de métodos de autenticação), escrever consultas de exemplo, executar a resposta inicial a uma identidade comprometida (revogação de sessões, desativação de chaves e busca de persistência), e padronizar modelos e um checklist.
+
+## 1. Fontes de eventos de identidade
+
+| Fonte | Conteúdo | Observações |
+|---|---|---|
+| Registros de entrada do provedor de identidade | Autenticações, métodos de MFA, locais, dispositivos, aplicativos e risco | Exportar e reter (a retenção padrão costuma ser curta) |
+| Registros de auditoria do diretório | Alterações de usuários, de grupos, de papéis, de aplicativos e de métodos de autenticação | Eventos de alto valor para detecção |
+| Registros de auditoria da nuvem (plano de controle) | Chamadas de API: criação de credenciais, alterações de políticas, assunção de funções | CloudTrail, log de atividade e Cloud Audit Logs |
+| Registros de acesso a dados | Acesso de identidades aos dados | Precisam ser habilitados (pasta 13) |
+| Registros de serviços de identidade e de segredos | Acessos a cofres e a chaves | Detectam uso anômalo de segredos |
+| Registros de aplicações SaaS | Autenticações e consentimentos | Integração ao SIEM |
+| Registros de PAM e de elevação | Ativações de papéis privilegiados | Correlação com chamados |
+| Registros de RH | Desligamentos e mudanças | Correlação de acessos após o desligamento |
+
+Todos devem ser **centralizados**, com **horário sincronizado**, retenção adequada e proteção contra alteração (pasta 13 e pasta 23).
+
+## 2. Detecções prioritárias de identidade
+
+| # | Detecção | Técnica ATT&CK | Gravidade |
+|---|---|---|---|
+| 1 | Uso da conta raiz ou de proprietário, e de contas de emergência | T1078.004 | Crítica |
+| 2 | Entrada no console sem MFA (quando exigido) ou com MFA desabilitado recentemente | T1078.004, T1556 | Alta |
+| 3 | Alteração ou registro de método de autenticação por conta privilegiada | T1556, T1098 | Alta |
+| 4 | Atribuição de papéis privilegiados (administrador global, proprietário e administradores de segurança) | T1098.003 | Alta |
+| 5 | Criação de usuários, de chaves de acesso e de credenciais de contas de serviço | T1136.003, T1098.001 | Alta |
+| 6 | Alteração de políticas de confiança de funções e de políticas de identidade amplas | T1098 | Alta |
+| 7 | Concessão de consentimento a aplicativos com permissões amplas (leitura de e-mail e de arquivos) | T1528 | Alta |
+| 8 | Tentativas de MFA em excesso (fadiga) seguidas de sucesso | T1621 | Alta |
+| 9 | Entrada de local ou dispositivo incomum; viagem impossível; uso de anonimizadores | T1078 | Média a alta |
+| 10 | Uso de chaves de acesso de origem desconhecida ou fora do padrão | T1078.004 | Alta |
+| 11 | Desativação de registros e de detecção | T1562.008 | Crítica |
+| 12 | Acesso a segredos e a chaves fora do padrão | T1555, T1552 | Alta |
+| 13 | Entrada após o desligamento da pessoa | T1078 | Alta |
+| 14 | Múltiplas falhas de autenticação de várias contas a partir de uma origem (pulverização de senhas) | T1110.003 | Média |
+| 15 | Uso de tokens de sessão por IPs distintos em curto intervalo (roubo de sessão) | T1539, T1550 | Alta |
+
+## 3. Consultas de exemplo
+
+### 3.1 AWS (Amazon Athena sobre registros do CloudTrail)
+
+```sql
+-- Entradas no console sem MFA (últimos 7 dias); ajuste o nome da tabela e o particionamento
+SELECT eventtime, useridentity.arn, sourceipaddress, useragent,
+       json_extract_scalar(additionaleventdata, '$.MFAUsed') AS mfa_usado
+FROM cloudtrail_logs
+WHERE eventname = 'ConsoleLogin'
+  AND json_extract_scalar(responseelements, '$.ConsoleLogin') = 'Success'
+  AND json_extract_scalar(additionaleventdata, '$.MFAUsed') = 'No'
+  AND eventtime > to_iso8601(current_timestamp - interval '7' day)
+ORDER BY eventtime DESC;
+
+-- Criação de chaves, de usuários e alteração de políticas de confiança (persistência)
+SELECT eventtime, eventname, useridentity.arn, sourceipaddress, requestparameters
+FROM cloudtrail_logs
+WHERE eventname IN ('CreateAccessKey', 'CreateUser', 'UpdateAssumeRolePolicy', 'AttachUserPolicy', 'PutUserPolicy', 'DeactivateMFADevice')
+  AND eventtime > to_iso8601(current_timestamp - interval '7' day)
+ORDER BY eventtime DESC;
+```
+
+### 3.2 Microsoft Entra ID (KQL)
+
+```kusto
+// Atribuição de papéis privilegiados no diretório
+AuditLogs
+| where TimeGenerated > ago(7d)
+| where OperationName in ("Add member to role", "Add eligible member to role")
+| extend ator = tostring(InitiatedBy.user.userPrincipalName), alvo = tostring(TargetResources[0].displayName)
+| project TimeGenerated, OperationName, ator, alvo, Result
+
+// Alteração de métodos de autenticação por contas
+AuditLogs
+| where TimeGenerated > ago(7d)
+| where OperationName has_any ("User registered security info", "User deleted security info", "Admin registered security info")
+| project TimeGenerated, OperationName, InitiatedBy, TargetResources
+
+// Muitos pedidos de MFA seguidos de sucesso para o mesmo usuário (sinal de fadiga de MFA)
+SigninLogs
+| where TimeGenerated > ago(1d)
+| where ResultType in ("500121", "0")
+| summarize falhas = countif(ResultType == "500121"), sucessos = countif(ResultType == "0") by UserPrincipalName, bin(TimeGenerated, 1h)
+| where falhas >= 5 and sucessos >= 1
+```
+
+O código de resultado `500121` indica falha na etapa de autenticação multifator no Entra ID; confirme os códigos na documentação vigente.
+
+### 3.3 Google Cloud (Cloud Logging)
+
+```
+# Alterações de políticas IAM (Atividade de administrador)
+protoPayload.methodName="SetIamPolicy"
+
+# Criação de chaves de contas de serviço
+protoPayload.methodName="google.iam.admin.v1.CreateServiceAccountKey"
+```
+
+## 4. Resposta inicial a uma identidade comprometida
+
+```mermaid
+flowchart TD
+    A["Alerta: suspeita de comprometimento de identidade"] --> B["Preservar: exportar registros de entrada, de auditoria e da nuvem do período"]
+    B --> C["Conter: revogar sessões e tokens; redefinir credenciais; desativar chaves; restringir acesso"]
+    C --> D["Investigar: ações realizadas, recursos acessados e dados afetados"]
+    D --> E["Procurar persistência: novas credenciais, usuários, papéis, consentimentos, métodos de MFA e políticas de confiança"]
+    E --> F["Erradicar: remover acessos indevidos e rotacionar segredos acessíveis"]
+    F --> G["Recuperar e reforçar: autenticação forte, privilégio mínimo e monitoramento"]
+    G --> H["Lições aprendidas e atualização das detecções"]
+```
+
+| Passo | Ação por provedor |
+|---|---|
+| Preservar | Exportar os registros antes de alterar o estado (retenção curta); registrar o estado atual das credenciais e das políticas |
+| Revogar sessões | Microsoft Entra ID: revogar as sessões do usuário (por exemplo, com o cmdlet `Revoke-MgUserSignInSession`); AWS: política de negação com condição de tempo de emissão do token; Google: encerrar sessões e redefinir a conta |
+| Desativar credenciais | Desativar (e não excluir) as chaves de acesso e de contas de serviço comprometidas, preservando a evidência |
+| Redefinir | Senhas, métodos de MFA e segredos relacionados |
+| Persistência | Revisar criação de usuários, de chaves, de papéis, de consentimentos, de regras de e-mail e de alterações de políticas de confiança |
+| Escopo | Reconstruir a atividade pelos registros (pasta 23, forense em nuvem) |
+| Comunicação | Jurídico e DPO, se houver dados pessoais envolvidos (LGPD, art. 48) |
+
+### Exemplo: política de negação para revogar sessões antigas (AWS)
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "RevogarSessoesEmitidasAntesDeUmaData",
+      "Effect": "Deny",
+      "Action": "*",
+      "Resource": "*",
+      "Condition": {
+        "DateLessThan": { "aws:TokenIssueTime": "2026-11-15T12:00:00Z" }
+      }
+    }
+  ]
+}
+```
+
+Anexada a uma função ou a um usuário, a política nega as credenciais temporárias emitidas **antes** do horário indicado, forçando uma nova autenticação. É o mesmo mecanismo usado pela ação de revogar sessões ativas do console. Preserve os registros antes de aplicar e ajuste o horário ao momento da resposta.
+
+## 5. Modelos
+
+### 5.1 Registro de incidente de identidade
+
+| Campo | Preenchimento |
+|---|---|
+| ID e data (UTC) | |
+| Identidade afetada (tipo, nome e privilégios) | |
+| Fonte da detecção | |
+| Janela de interesse (início provável e fim) | |
+| Ações realizadas pelo atacante (resumo) | |
+| Credenciais e sessões revogadas (hora e responsável) | |
+| Persistência encontrada e removida | |
+| Dados e recursos afetados | |
+| Registros preservados (referências e hashes) | |
+| Comunicação (jurídico, DPO e autoridades) | |
+| Ações corretivas e responsáveis | |
+
+### 5.2 Registro de detecções de identidade
+
+| ID | Detecção | Fonte de dados | Técnica ATT&CK | Lógica (resumo) | Gravidade | Teste realizado (data) | Falsos positivos esperados | Responsável |
+|---|---|---|---|---|---|---|---|---|
+| DET-ID-001 | Uso da conta raiz | Registros da nuvem | T1078.004 | Qualquer evento da conta raiz | Crítica | | Procedimentos autorizados | |
+
+### 5.3 Inventário de contas privilegiadas e de emergência
+
+| Conta | Tipo | Proprietário | Autenticação | Último teste ou uso | Monitoramento | Revisão |
+|---|---|---|---|---|---|---|
+| | | | | | | |
+
+### 5.4 Matriz de segregação de funções
+
+| Direito A | Direito B | Conflito | Controle (bloqueio, exceção ou compensatório) |
+|---|---|---|---|
+| Administrar chaves | Acessar dados | Sim | Bloqueio na solicitação |
+
+## 6. Checklist operacional: identidade em operação
+
+**Ambiente:** ____________________
+**Responsável:** ____________________
+**Data:** ____________________
+
+### 6.1 Autenticação e acesso privilegiado
+
+- [ ] MFA resistente a phishing em contas administrativas e no plano de controle
+- [ ] Conta raiz protegida; contas de emergência testadas e monitoradas
+- [ ] Elevação sob demanda para papéis privilegiados, com aprovação e prazo
+- [ ] Autenticação legada bloqueada; acesso condicional em operação
+
+### 6.2 Autorização e identidades não humanas
+
+- [ ] Sem permissões com curinga em identidades de uso regular; papéis por função
+- [ ] Credenciais temporárias e federação para cargas e pipelines; chaves de longa duração inventariadas
+- [ ] Segredos em cofre, com rotação e varredura
+
+### 6.3 Governança
+
+- [ ] Ciclo de entrada, mudança e saída automatizado, com desativação imediata no desligamento
+- [ ] Revisões de acesso periódicas concluídas, com remoções verificadas
+- [ ] Convidados e terceiros com patrocinador e expiração
+
+### 6.4 Monitoramento e resposta
+
+- [ ] Registros de entrada, de auditoria e da nuvem centralizados e retidos
+- [ ] Detecções prioritárias implantadas, testadas e atribuídas a responsáveis
+- [ ] Playbook de identidade comprometida definido e testado
+- [ ] Exercício de resposta a identidade privilegiada comprometida no último ano
+
+## 7. Resultado da verificação
+
+| Resultado | Condição |
+|---|---|
+| Conforme | Todos os itens aplicáveis marcados |
+| Conforme com ressalvas | Pendências sem exposição de acesso privilegiado, com plano e prazo |
+| Não conforme | Contas privilegiadas sem MFA forte, privilégios permanentes sem controle, conta raiz desprotegida, ausência de registros de identidade ou de detecções críticas; corrigir com prioridade |
+
+**Assinatura do responsável:** ____________________
+**Assinatura do revisor:** ____________________
+
+## 8. Exemplo prático: investigação de uma alteração de política de confiança
+
+| Etapa | Resultado |
+|---|---|
+| Alerta | Detecção DET-ID de alteração de política de confiança de uma função de produção às 02:14 UTC |
+| Preservação | Exportação dos registros do período; estado atual da função e das políticas |
+| Análise | A política passou a permitir a assunção por uma conta externa desconhecida; a alteração foi feita por uma chave de acesso de um usuário de integração |
+| Escopo | A função foi assumida 3 vezes da conta externa; foram listados buckets e lidos objetos de um bucket com logs |
+| Contenção | Chave desativada; política de confiança restaurada; sessões da função revogadas; função com permissões reduzidas |
+| Persistência | Foi criado um usuário adicional com chave de acesso, removido após preservação |
+| Causa | Chave de longa duração exposta em repositório; permissões de alteração de papéis excessivas |
+| Reforço | Federação do pipeline, remoção das chaves, negação de alterações de confiança por política organizacional, alerta imediato para alterações de confiança |
+
+## 9. Casos de uso corporativos
+
+- Central de detecção de ameaças de identidade com detecções priorizadas e testadas.
+- Playbook de resposta a contas comprometidas, integrado ao SOC.
+- Evidências de monitoramento de identidade para auditorias e para certificações.
+
+## 10. Normas e frameworks relevantes
+
+- MITRE ATT&CK for Cloud: T1078.004, T1098, T1136.003, T1528, T1550.001, T1556, T1562.008, T1621
+- NIST SP 800-61 Rev. 3; NIST SP 800-92 (gestão de logs); NIST SP 800-53 Rev. 5 (AU, IR e SI-4); NIST CSF 2.0 (DE, detectar)
+- CSA CCM v4 (LOG, IAM e SEF); ISO/IEC 27002:2022 (8.15, 8.16 e 5.24 a 5.28); CIS Controls v8.1 (controles 8 e 17)
+- LGPD, arts. 46 e 48
+
+## 11. Referências
+
+- MITRE. ATT&CK for Cloud. https://attack.mitre.org
+- Kent, K.; Souppaya, M. NIST SP 800-92: Guide to Computer Security Log Management. 2006.
+- Documentação de registros e de auditoria: AWS CloudTrail, Microsoft Entra ID (registros de entrada e de auditoria) e Google Cloud Audit Logs.
+- Documentação sobre revogação de sessões: AWS IAM (revogar credenciais de segurança temporárias de funções) e Microsoft Graph (revokeSignInSessions).
+- Pastas 13, 22 e 23 deste repositório.
